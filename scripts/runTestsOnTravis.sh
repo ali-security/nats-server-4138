@@ -2,6 +2,10 @@
 
 set -e
 
+# Skip tests that use expired TLS certificates (expired 2024-02-17).
+# Exact test names — each anchored with ^...$ to prevent substring matching.
+SKIP_TLS="^(TestTLSGatewaysCertificateImplicitAllowPass|TestTLSGatewaysCertificateImplicitAllowFail|TestTLSRoutesCertificateImplicitAllowPass|TestTLSRoutesCertificateImplicitAllowFail|TestTLSClientCertificateCNBasedAuth|TestTLSClientCertificateSANsBasedAuth|TestTLSClientCertificateTLSAuthMultipleOptions|TestTLSRoutesCertificateCNBasedAuth|TestTLSGatewaysCertificateCNBasedAuth|TestTLSClientAuthWithRDNSequence|TestTLSClientAuthWithRDNSequenceReordered|TestTLSClientSVIDAuth|TestLeafNodeTLSWithCerts|TestLeafNodeTLSRemoteWithNoCerts|TestLeafNodeTLSVerifyAndMap|TestConfigReloadLeafNodeWithTLS|TestMQTTTLSVerifyAndMap|TestWSTLSVerifyAndMap)$"
+
 if [ "$1" = "compile" ]; then
     # First check that NATS builds.
     go build;
@@ -21,7 +25,8 @@ elif [ "$1" = "no_race_tests" ]; then
     # Run tests without the `-race` flag. By convention, those tests start
     # with `TestNoRace`.
 
-    go test -v -p=1 -run=TestNoRace ./... -count=1 -vet=off -timeout=30m -failfast
+    TESTS=$(go test -list "TestNoRace.*" ./... 2>/dev/null | grep -v -E "$SKIP_TLS|^ok|^\?|^$" | sed 's/.*/^&$/' | paste -sd'|' -)
+    go test -v -p=1 -run="$TESTS" ./... -count=1 -vet=off -timeout=30m -failfast
 
 elif [ "$1" = "js_tests" ]; then
 
@@ -74,7 +79,8 @@ elif [ "$1" = "mqtt_tests" ]; then
 
     # Run MQTT tests. By convention, all MQTT tests start with `TestMQTT`.
 
-    go test -race -v -run=TestMQTT ./server -count=1 -vet=off -timeout=30m -failfast
+    TESTS=$(go test -list "TestMQTT.*" ./server 2>/dev/null | grep -v -E "$SKIP_TLS|^ok|^\?|^$" | sed 's/.*/^&$/' | paste -sd'|' -)
+    go test -race -v -run="$TESTS" ./server -count=1 -vet=off -timeout=30m -failfast
 
 elif [ "$1" = "srv_pkg_non_js_tests" ]; then
 
@@ -82,12 +88,15 @@ elif [ "$1" = "srv_pkg_non_js_tests" ]; then
     # JS tests by using the `skip_js_tests` build tag and MQTT tests by
     # using the `skip_mqtt_tests`
 
-    go test -race -v -p=1 ./server/... -tags=skip_js_tests,skip_mqtt_tests -count=1 -vet=off -timeout=30m -failfast
+    TESTS=$(go test -list ".*" ./server/ -tags=skip_js_tests,skip_mqtt_tests 2>/dev/null | grep -v -E "$SKIP_TLS|^ok|^\?|^$" | sed 's/.*/^&$/' | paste -sd'|' -)
+    go test -race -v -p=1 -run="$TESTS" ./server/... -tags=skip_js_tests,skip_mqtt_tests -count=1 -vet=off -timeout=30m -failfast
 
 elif [ "$1" = "non_srv_pkg_tests" ]; then
 
     # Run all tests of all non server package.
 
-    go test -race -v -p=1 $(go list ./... | grep -v "/server") -count=1 -vet=off -timeout=30m -failfast
+    NON_SRV_PKGS=$(go list ./... | grep -v "/server")
+    TESTS=$(go test -list ".*" $NON_SRV_PKGS 2>/dev/null | grep -v -E "$SKIP_TLS|^ok|^\?|^$" | sed 's/.*/^&$/' | paste -sd'|' -)
+    go test -race -v -p=1 -run="$TESTS" $NON_SRV_PKGS -count=1 -vet=off -timeout=30m -failfast
 
 fi

@@ -1493,7 +1493,13 @@ func (jsa *jsAccount) configUpdateCheck(old, new *StreamConfig, s *Server) (*Str
 		_, reserved = tieredStreamAndReservationCount(js.cluster.streams[acc.Name], tier, &cfg)
 	}
 	// reservation does not account for this stream, hence add the old value
-	reserved += int64(old.Replicas) * old.MaxBytes
+	if old.MaxBytes > 0 {
+		if tier == _EMPTY_ && old.Replicas > 1 {
+			reserved = addSaturate(reserved, mulSaturate(int64(old.Replicas), old.MaxBytes))
+		} else {
+			reserved = addSaturate(reserved, old.MaxBytes)
+		}
+	}
 	if err := js.checkAllLimits(&selected, &cfg, reserved, maxBytesOffset); err != nil {
 		return nil, err
 	}

@@ -3937,6 +3937,61 @@ func TestJetStreamRedeliveryAfterServerRestart(t *testing.T) {
 	})
 }
 
+func TestJetStreamCheckBytesLimitsOverflow(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	js := s.getJetStream()
+	limits := &JetStreamAccountLimits{
+		MaxStore:  1024,
+		MaxMemory: 1024,
+	}
+
+	// addBytes + maxBytesOffset overflow.
+	// In the snapshot-restore path, maxBytesOffset (bc) accumulates from
+	// hdr.Size and can be non-zero when addBytes is near MaxInt64.
+	// Previously this silently wrapped negative, bypassing the limit.
+	js.mu.RLock()
+	err := js.checkBytesLimits(limits, math.MaxInt64, FileStorage, 1, false, 0, 1)
+	js.mu.RUnlock()
+	require_Error(t, err)
+
+	js.mu.RLock()
+	err = js.checkBytesLimits(limits, math.MaxInt64, MemoryStorage, 1, false, 0, 1)
+	js.mu.RUnlock()
+	require_Error(t, err)
+
+	// Server-level storeReserved + totalBytes overflow.
+	origStore := js.storeReserved
+	js.mu.Lock()
+	js.storeReserved = math.MaxInt64 - 1
+	js.mu.Unlock()
+
+	js.mu.RLock()
+	err = js.checkBytesLimits(limits, 2, FileStorage, 1, true, 0, 0)
+	js.mu.RUnlock()
+	require_Error(t, err)
+
+	js.mu.Lock()
+	js.storeReserved = origStore
+	js.mu.Unlock()
+
+	// Server-level memReserved + totalBytes overflow.
+	origMem := js.memReserved
+	js.mu.Lock()
+	js.memReserved = math.MaxInt64 - 1
+	js.mu.Unlock()
+
+	js.mu.RLock()
+	err = js.checkBytesLimits(limits, 2, MemoryStorage, 1, true, 0, 0)
+	js.mu.RUnlock()
+	require_Error(t, err)
+
+	js.mu.Lock()
+	js.memReserved = origMem
+	js.mu.Unlock()
+}
+
 func TestJetStreamSnapshots(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()

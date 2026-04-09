@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -145,7 +146,7 @@ type wsUpgradeResult struct {
 }
 
 type wsReadInfo struct {
-	rem   int
+	rem   uint64
 	fs    bool
 	ff    bool
 	fc    bool
@@ -166,19 +167,19 @@ func (r *wsReadInfo) init() {
 // of bytes found up to `needed` and the new position is returned. If not
 // enough bytes are found, the bytes found in `buf` are copied to the returned
 // slice and the remaning bytes are read from `r`.
-func wsGet(r io.Reader, buf []byte, pos, needed int) ([]byte, int, error) {
-	avail := len(buf) - pos
+func wsGet(r io.Reader, buf []byte, pos, needed uint64) ([]byte, uint64, error) {
+	avail := uint64(len(buf)) - pos
 	if avail >= needed {
 		return buf[pos : pos+needed], pos + needed, nil
 	}
 	b := make([]byte, needed)
-	start := copy(b, buf[pos:])
+	start := uint64(copy(b, buf[pos:]))
 	for start != needed {
 		n, err := r.Read(b[start:cap(b)])
 		if err != nil {
 			return nil, 0, err
 		}
-		start += n
+		start += uint64(n)
 	}
 	return b, pos + avail, nil
 }
@@ -201,8 +202,9 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 		bufs   [][]byte
 		tmpBuf []byte
 		err    error
-		pos    int
-		max    = len(buf)
+		pos    uint64
+		max    = uint64(len(buf))
+		mpay   = int(atomic.LoadInt32(&c.mpay))
 	)
 	for pos != max {
 		if r.fs {
@@ -225,7 +227,7 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 			}
 
 			// Store size in case it is < 125
-			r.rem = int(b1 & 0x7F)
+			r.rem = uint64(b1 & 0x7F)
 
 			switch frameType {
 			case wsPingMessage, wsPongMessage, wsCloseMessage:
@@ -259,13 +261,15 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 				if err != nil {
 					return bufs, err
 				}
-				r.rem = int(binary.BigEndian.Uint16(tmpBuf))
+				r.rem = uint64(binary.BigEndian.Uint16(tmpBuf))
 			case 127:
 				tmpBuf, pos, err = wsGet(ior, buf, pos, 8)
 				if err != nil {
 					return bufs, err
 				}
-				r.rem = int(binary.BigEndian.Uint64(tmpBuf))
+				if r.rem = binary.BigEndian.Uint64(tmpBuf); r.rem&(uint64(1)<<63) != 0 {
+					return bufs, c.wsHandleProtocolError("invalid 64-bit payload length")
+				}
 			}
 
 			if r.mask {
@@ -292,7 +296,7 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 		}
 		if pos < max {
 			var b []byte
-			var n int
+			var n uint64
 
 			n = r.rem
 			if pos+n > max {
@@ -316,7 +320,7 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 				// When we have the final frame and we have read the full payload,
 				// we can decompress it.
 				if r.ff && r.rem == 0 {
-					b, err = r.decompress()
+					b, err = r.decompress(mpay)
 					if err != nil {
 						return bufs, err
 					}
@@ -390,7 +394,16 @@ func (r *wsReadInfo) ReadByte() (byte, error) {
 	return b, nil
 }
 
-func (r *wsReadInfo) decompress() ([]byte, error) {
+// decompress decompresses the collected buffers.
+// The size of the decompressed buffer will be limited to the `mpay` value.
+// If, while decompressing, the resulting uncompressed buffer exceeds this
+// limit, the decompression stops and an empty buffer and the ErrMaxPayload
+// error are returned.
+func (r *wsReadInfo) decompress(mpay int) ([]byte, error) {
+	// If not limit is specified, use the default maximum payload size.
+	if mpay <= 0 {
+		mpay = MAX_PAYLOAD_SIZE
+	}
 	r.coff = 0
 	// As per https://tools.ietf.org/html/rfc7692#section-7.2.2
 	// add 0x00, 0x00, 0xff, 0xff and then a final block so that flate reader
@@ -405,8 +418,15 @@ func (r *wsReadInfo) decompress() ([]byte, error) {
 	} else {
 		d.(flate.Resetter).Reset(r, nil)
 	}
-	// This will do the decompression.
-	b, err := io.ReadAll(d)
+	// Use a LimitedReader to limit the decompressed size.
+	// We use "limit+1" bytes for "N" so we can detect if the limit is exceeded.
+	lr := io.LimitedReader{R: d, N: int64(mpay + 1)}
+	b, err := io.ReadAll(&lr)
+	if err == nil && len(b) > mpay {
+		// Decompressed data exceeds the maximum payload size.
+		b, err = nil, ErrMaxPayload
+	}
+	lr.R = nil
 	decompressorPool.Put(d)
 	// Now reset the compressed buffers list.
 	r.cbufs = nil
@@ -416,7 +436,7 @@ func (r *wsReadInfo) decompress() ([]byte, error) {
 // Handles the PING, PONG and CLOSE websocket control frames.
 //
 // Client lock MUST NOT be held on entry.
-func (c *client) wsHandleControlFrame(r *wsReadInfo, frameType wsOpCode, nc io.Reader, buf []byte, pos int) (int, error) {
+func (c *client) wsHandleControlFrame(r *wsReadInfo, frameType wsOpCode, nc io.Reader, buf []byte, pos uint64) (uint64, error) {
 	var payload []byte
 	var err error
 

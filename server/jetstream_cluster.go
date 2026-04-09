@@ -1486,15 +1486,15 @@ func (js *jetStream) metaSnapshot() []byte {
 	return s2.EncodeBetter(nil, b)
 }
 
-func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecovering bool) error {
+func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecovering bool) {
 	var wsas []writeableStreamAssignment
 	if len(buf) > 0 {
 		jse, err := s2.Decode(nil, buf)
 		if err != nil {
-			return err
+			return
 		}
 		if err = json.Unmarshal(jse, &wsas); err != nil {
-			return err
+			return
 		}
 	}
 
@@ -1617,8 +1617,6 @@ func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecove
 			js.processConsumerAssignment(ca)
 		}
 	}
-
-	return nil
 }
 
 // Called on recovery to make sure we do not process like original.
@@ -5593,9 +5591,13 @@ func tieredStreamAndReservationCount(asa map[string]*streamAssignment, tier stri
 	reservation := int64(0)
 	if tier == _EMPTY_ {
 		for _, sa := range asa {
-			if sa.Config.MaxBytes > 0 && sa.Config.Name != cfg.Name {
-				if sa.Config.Storage == cfg.Storage {
-					reservation += (int64(sa.Config.Replicas) * sa.Config.MaxBytes)
+			if sa.Config.MaxBytes > 0 && sa.Config.Storage == cfg.Storage && sa.Config.Name != cfg.Name {
+				// If tier is empty, all storage is flat and we should adjust for replicas.
+				// Otherwise if tiered, storage replication already taken into consideration.
+				if sa.Config.Replicas > 1 {
+					reservation = addSaturate(reservation, mulSaturate(int64(sa.Config.Replicas), sa.Config.MaxBytes))
+				} else {
+					reservation = addSaturate(reservation, sa.Config.MaxBytes)
 				}
 			}
 		}
@@ -5604,10 +5606,8 @@ func tieredStreamAndReservationCount(asa map[string]*streamAssignment, tier stri
 		for _, sa := range asa {
 			if isSameTier(sa.Config, cfg) {
 				numStreams++
-				if sa.Config.MaxBytes > 0 {
-					if sa.Config.Storage == cfg.Storage && sa.Config.Name != cfg.Name {
-						reservation += (int64(sa.Config.Replicas) * sa.Config.MaxBytes)
-					}
+				if sa.Config.MaxBytes > 0 && sa.Config.Storage == cfg.Storage && sa.Config.Name != cfg.Name {
+					reservation = addSaturate(reservation, sa.Config.MaxBytes)
 				}
 			}
 		}

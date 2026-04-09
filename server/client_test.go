@@ -2516,3 +2516,19 @@ func TestClientAuthRequiredNoAuthUser(t *testing.T) {
 		t.Fatalf("Expected AuthRequired to be false due to 'no_auth_user'")
 	}
 }
+
+func TestRemoveHeaderIfPresentDuplicates(t *testing.T) {
+	hdr := []byte("NATS/1.0\r\n\r\n")
+
+	hdr = genHeader(hdr, "a", "1")
+	hdr = genHeader(hdr, "a", "2")
+	hdr = genHeader(hdr, "c", "3")
+	hdr = genHeader(hdr, "a", "4")
+	hdr = genHeader(hdr, "a", "5")
+
+	hdr = removeHeaderIfPresent(hdr, "a")
+
+	if !bytes.Equal(hdr, []byte("NATS/1.0\r\nc: 3\r\n\r\n")) {
+		t.Fatalf("Expected headers to be stripped, got %q", hdr)
+	}
+}

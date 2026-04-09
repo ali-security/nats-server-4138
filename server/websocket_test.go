@@ -72,9 +72,9 @@ func TestWSGet(t *testing.T) {
 
 	for _, test := range []struct {
 		name   string
-		pos    int
-		needed int
-		newpos int
+		pos    uint64
+		needed uint64
+		newpos uint64
 		trmax  int
 		result string
 		reterr bool
@@ -965,6 +965,16 @@ func TestWSReadErrors(t *testing.T) {
 				return testWSCreateClientMsg(99, 1, false, false, []byte("hello"))
 			},
 			"unknown opcode", 1,
+		},
+		{
+			func() []byte {
+				msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, nil)
+				msg = append(msg, 0, 0, 0, 0)
+				msg[1] = 127 | wsMaskBit
+				binary.BigEndian.PutUint64(msg[2:], uint64(1)<<63)
+				return msg
+			},
+			"invalid 64-bit payload length", 1,
 		},
 	} {
 		t.Run(test.err, func(t *testing.T) {
@@ -4063,6 +4073,98 @@ func TestWSWithPartialWrite(t *testing.T) {
 		if !bytes.Equal(msgs[i], rmsg.Data) {
 			t.Fatalf("Expected message %q, got %q", msgs[i], rmsg.Data)
 		}
+	}
+}
+
+func TestWSDecompressLimit(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mpayCfg string
+	}{
+		{"not explicitly configured", _EMPTY_},
+		{"explicit high", "max_payload: 2097152"},
+		{"explicit low", "max_payload: 4096"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conf := createConfFile(t, fmt.Appendf(nil, `
+				listen: "127.0.0.1:-1"
+				websocket {
+					listen: "127.0.0.1:-1"
+					no_tls: true
+				}
+				%s
+			`, test.mpayCfg))
+			s, o := RunServerWithConfig(conf)
+			defer s.Shutdown()
+
+			l := &captureErrorLogger{errCh: make(chan string, 10)}
+			s.SetLogger(l, false, false)
+
+			// Create a client that will use compression.
+			wsc, br, _ := testNewWSClient(t, testWSClientOptions{
+				compress: true,
+				host:     o.Websocket.Host,
+				port:     o.Websocket.Port,
+				noTLS:    true,
+			})
+			// We will hand-craft a frame that would use a 10MB of uncompressed zeros
+			// that should compress really small.
+			buf := &bytes.Buffer{}
+			compressor, _ := flate.NewWriter(buf, 1)
+			chunk := make([]byte, 1024*1024)
+			// Compress the equivalent of 100MB of data. We do by chunks to limit
+			// memory usage here.
+			for i := 0; i < 100; i++ {
+				compressor.Write(chunk)
+			}
+			compressor.Flush()
+			payload := buf.Bytes()
+			// The last 4 bytes are dropped
+			payload = payload[:len(payload)-4]
+			lenPayload := len(payload)
+			frame := make([]byte, 14+lenPayload)
+			frame[0] = byte(wsBinaryMessage)
+			frame[0] |= wsFinalBit
+			frame[0] |= wsRsv1Bit
+			pos := 1
+			switch {
+			case lenPayload <= 125:
+				frame[pos] = byte(lenPayload) | wsMaskBit
+				pos++
+			case lenPayload < 65536:
+				frame[pos] = 126 | wsMaskBit
+				binary.BigEndian.PutUint16(frame[2:], uint16(lenPayload))
+				pos += 3
+			default:
+				frame[1] = 127 | wsMaskBit
+				binary.BigEndian.PutUint64(frame[2:], uint64(lenPayload))
+				pos += 9
+			}
+			key := []byte{1, 2, 3, 4}
+			copy(frame[pos:], key)
+			pos += 4
+			copy(frame[pos:], payload)
+			testWSSimpleMask(key, frame[pos:])
+			pos += lenPayload
+			toSend := frame[:pos]
+			if _, err := wsc.Write(toSend); err != nil {
+				t.Fatalf("Error sending message: %v", err)
+			}
+
+			// We should have been disconnected.
+			rbuf := make([]byte, 1024)
+			_, err := br.Read(rbuf)
+			require_Error(t, err)
+
+			select {
+			case err := <-l.errCh:
+				if !strings.Contains(err, ErrMaxPayload.Error()) {
+					t.Fatalf("Expected %s error, got %s", ErrMaxPayload, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Did not get the expected error")
+			}
+		})
 	}
 }
 

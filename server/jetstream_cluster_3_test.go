@@ -5559,3 +5559,97 @@ func TestJetStreamClusterRestartThenScaleStreamReplicas(t *testing.T) {
 	cancel()
 	wg.Wait()
 }
+
+func TestJetStreamClusterTieredReservationConsistency(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, cjs := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	for _, replicas := range []int{1, 3} {
+		subj := fmt.Sprintf("R%d", replicas)
+		maxBytes := int64(1)
+		if replicas > 1 {
+			maxBytes = 10
+		}
+		_, err := cjs.AddStream(&nats.StreamConfig{
+			Name:      subj,
+			Replicas:  replicas,
+			Storage:   nats.FileStorage,
+			Retention: nats.LimitsPolicy,
+			MaxBytes:  maxBytes,
+		})
+		require_NoError(t, err)
+	}
+	c.waitOnStreamLeader(globalAccountName, "R3")
+
+	sl := c.streamLeader(globalAccountName, "R1")
+	_, js, jsa := sl.globalAccount().getJetStreamFromAccount()
+
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	jsa.mu.RLock()
+	defer jsa.mu.RUnlock()
+
+	cfg := &StreamConfig{Storage: FileStorage}
+
+	// No tier, R1: 1, R3: 10*R
+	tier := _EMPTY_
+	require_Equal(t, jsa.tieredReservation(tier, cfg), 31)
+	streams, reservation := tieredStreamAndReservationCount(js.cluster.streams[globalAccountName], tier, cfg)
+	require_Equal(t, streams, 2)
+	require_Equal(t, reservation, 31)
+
+	// R1 tier, R1: 1
+	tier, cfg.Replicas = "R1", 1
+	require_Equal(t, jsa.tieredReservation(tier, cfg), 1)
+	streams, reservation = tieredStreamAndReservationCount(js.cluster.streams[globalAccountName], tier, cfg)
+	require_Equal(t, streams, 1)
+	require_Equal(t, reservation, 1)
+
+	// R3 tier, R3: 10
+	tier, cfg.Replicas = "R3", 3
+	require_Equal(t, jsa.tieredReservation(tier, cfg), 10)
+	streams, reservation = tieredStreamAndReservationCount(js.cluster.streams[globalAccountName], tier, cfg)
+	require_Equal(t, streams, 1)
+	require_Equal(t, reservation, 10)
+}
+
+func TestJetStreamClusterTieredReservationOverflow(t *testing.T) {
+	// In v2.9.24, checkBytesLimits multiplies addBytes * replicas, so we
+	// need the account and server limits at MaxInt64 so S1 creation passes
+	// even when the product saturates. The overflow test then verifies that
+	// accumulated reservations (via tieredReservation) don't wrap negative.
+	tmpl := strings.Replace(jsClusterMaxBytesAccountLimitTempl, "max_file_store: 4GB", "max_file_store: 9223372036854775807", 1)
+	tmpl = strings.Replace(tmpl, "max_file:  3GB", "max_file:  9223372036854775807", 1)
+	c := createJetStreamClusterWithTemplate(t, tmpl, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Create a stream with R=3 and MaxBytes large enough that
+	// Replicas * MaxBytes overflows int64:
+	//   3 * 4e18 = 12e18 > MaxInt64 (9.22e18)
+	// With saturating math, totalBytes = MaxInt64 which is <= account limit.
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "S1",
+		Subjects: []string{"s1"},
+		MaxBytes: 4_000_000_000_000_000_000, // 4e18
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// The reservation for S1 saturates to MaxInt64. Creating any additional
+	// stream should be rejected because currentRes = MaxInt64 already
+	// exhausts the account limit. Without the saturation fix, the
+	// reservation computation wraps negative, making room appear.
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "S2",
+		Subjects: []string{"s2"},
+		MaxBytes: 1,
+		Replicas: 3,
+	})
+	require_Error(t, err, errors.New("nats: insufficient storage resources available"))
+}

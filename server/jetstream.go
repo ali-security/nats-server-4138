@@ -2143,29 +2143,25 @@ func (js *jetStream) checkBytesLimits(selectedLimits *JetStreamAccountLimits, ad
 	if addBytes < 0 {
 		addBytes = 1
 	}
-	totalBytes := (addBytes * int64(replicas)) + maxBytesOffset
+	totalBytes := addSaturate(mulSaturate(addBytes, int64(replicas)), maxBytesOffset)
 
 	switch storage {
 	case MemoryStorage:
 		// Account limits defined.
-		if selectedLimits.MaxMemory >= 0 {
-			if currentRes+totalBytes > selectedLimits.MaxMemory {
-				return NewJSMemoryResourcesExceededError()
-			}
+		if selectedLimits.MaxMemory >= 0 && (currentRes > selectedLimits.MaxMemory || totalBytes > selectedLimits.MaxMemory-currentRes) {
+			return NewJSMemoryResourcesExceededError()
 		}
 		// Check if this server can handle request.
-		if checkServer && js.memReserved+addBytes > js.config.MaxMemory {
+		if checkServer && (js.memReserved > js.config.MaxMemory || addBytes > js.config.MaxMemory-js.memReserved) {
 			return NewJSMemoryResourcesExceededError()
 		}
 	case FileStorage:
 		// Account limits defined.
-		if selectedLimits.MaxStore >= 0 {
-			if currentRes+totalBytes > selectedLimits.MaxStore {
-				return NewJSStorageResourcesExceededError()
-			}
+		if selectedLimits.MaxStore >= 0 && (currentRes > selectedLimits.MaxStore || totalBytes > selectedLimits.MaxStore-currentRes) {
+			return NewJSStorageResourcesExceededError()
 		}
 		// Check if this server can handle request.
-		if checkServer && js.storeReserved+addBytes > js.config.MaxStore {
+		if checkServer && (js.storeReserved > js.config.MaxStore || addBytes > js.config.MaxStore-js.storeReserved) {
 			return NewJSStorageResourcesExceededError()
 		}
 	}
