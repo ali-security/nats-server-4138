@@ -9591,6 +9591,15 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 	s, js, jsa, st, r, tierName, outq, node := mset.srv, mset.js, mset.jsa, mset.cfg.Storage, mset.cfg.Replicas, mset.tier, mset.outq, mset.node
 	maxMsgSize, lseq := int(mset.cfg.MaxMsgSize), mset.lseq
 	isLeader, isSealed, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules := mset.isLeader(), mset.cfg.Sealed, mset.cfg.AllowRollup, mset.cfg.DenyPurge, mset.cfg.AllowMsgTTL, mset.cfg.AllowMsgCounter, mset.cfg.AllowMsgSchedules
+
+	// Apply the input subject transform if any
+	if mset.itr != nil {
+		ts, err := mset.itr.Match(subject)
+		if err == nil {
+			// no filtering: if the subject doesn't map the source of the transform, don't change it
+			subject = ts
+		}
+	}
 	mset.mu.RUnlock()
 
 	// This should not happen but possible now that we allow scale up, and scale down where this could trigger.

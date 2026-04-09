@@ -5779,15 +5779,6 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		mset.clMu.Unlock()
 	}
 
-	// Apply the input subject transform if any
-	if mset.itr != nil {
-		ts, err := mset.itr.Match(subject)
-		if err == nil {
-			// no filtering: if the subject doesn't map the source of the transform, don't change it
-			subject = ts
-		}
-	}
-
 	var accName string
 	if mset.acc != nil {
 		accName = mset.acc.Name
@@ -5832,6 +5823,16 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			// Disable consistency checking if this was already done
 			// earlier as part of the batch consistency check.
 			canConsistencyCheck = traceOnly
+		}
+	}
+
+	// Apply the input subject transform if any
+	// But, only do so if we haven't already done so at the clustered level.
+	if canConsistencyCheck && mset.itr != nil {
+		ts, err := mset.itr.Match(subject)
+		if err == nil {
+			// no filtering: if the subject doesn't map the source of the transform, don't change it
+			subject = ts
 		}
 	}
 
@@ -6884,6 +6885,9 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 	// Proceed with proposing the batch.
 	ts := time.Now().UnixNano()
 
+	// Need to hold at least the read lock to possibly perform subject transforms.
+	mset.mu.RLock()
+
 	// Need to hold this lock even if we're not clustered, because we'll
 	// be accessing state that requires this lock (even if it's empty).
 	mset.clMu.Lock()
@@ -6906,6 +6910,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 			mset.clseq -= seq - 1
 		}
 		mset.clMu.Unlock()
+		mset.mu.RUnlock()
 	}
 
 	errorOnUnsupported := func(seq uint64, header string) *ApiError {
@@ -6947,6 +6952,15 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 			return respondIncompleteBatch()
 		}
 
+		// Apply the input subject transform if any
+		if mset.itr != nil {
+			ts, err := mset.itr.Match(bsubj)
+			if err == nil {
+				// no filtering: if the subject doesn't map the source of the transform, don't change it
+				bsubj = ts
+			}
+		}
+
 		// Reject unsupported headers.
 		if getExpectedLastMsgId(bhdr) != _EMPTY_ {
 			return errorOnUnsupported(seq, JSExpectedLastMsgId)
@@ -6982,6 +6996,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 		// Reset, we only used this to do the batching checks.
 		mset.clseq, mset.clfs = 0, 0
 		mset.clMu.Unlock()
+		mset.mu.RUnlock()
 
 		// Ensure the whole batch is fully isolated, and reads
 		// can only happen after the full batch is committed.
@@ -7009,6 +7024,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 		}
 		mset.mu.Unlock()
 	} else {
+		mset.mu.RUnlock()
 		// Do a single multi proposal. This ensures we get to push all entries to the proposal queue in-order
 		// and not interleaved with other proposals.
 		diff.commit(mset)
@@ -7039,6 +7055,15 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 	s, js, jsa, st, r, tierName, outq, node := mset.srv, mset.js, mset.jsa, mset.cfg.Storage, mset.cfg.Replicas, mset.tier, mset.outq, mset.node
 	maxMsgSize, lseq := int(mset.cfg.MaxMsgSize), mset.lseq
 	isLeader, isClustered, isSealed, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, allowBatchPublish := mset.isLeader(), mset.isClustered(), mset.cfg.Sealed, mset.cfg.AllowRollup, mset.cfg.DenyPurge, mset.cfg.AllowMsgTTL, mset.cfg.AllowMsgCounter, mset.cfg.AllowMsgSchedules, mset.cfg.AllowBatchPublish
+
+	// Apply the input subject transform if any
+	if mset.itr != nil {
+		ts, err := mset.itr.Match(subject)
+		if err == nil {
+			// no filtering: if the subject doesn't map the source of the transform, don't change it
+			subject = ts
+		}
+	}
 	mset.mu.RUnlock()
 
 	// If message tracing (with message delivery), we will need to send the
